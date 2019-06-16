@@ -1,47 +1,92 @@
 """
-    test_ambiguities(package::Module)
-    test_ambiguities(packages::Vector{Symbol})
+    test_ambiguities(package::Union{Module, PkgId})
+    test_ambiguities(packages::Vector{Union{Module, PkgId}})
 
 Test that there is no method ambiguities in given package(s).  It
 calls `Test.detect_ambiguities` in a separated clean process to avoid
 false-positive.
 """
-function test_ambiguities(packages)
-    packages = map(Symbol, packages) :: Vector{Symbol}
-    packages_repr = repr(packages)
-    @assert Base.eval(Main, Meta.parse(packages_repr)) == packages
+test_ambiguities(packages; kwargs...) =
+    _test_ambiguities(aspkgids(packages); kwargs...)
+
+aspkgids(pkg::Union{Module, PkgId}) = aspkgids([pkg])
+aspkgids(packages) = mapfoldl(aspkgid, push!, packages, init=PkgId[])
+
+aspkgid(pkg::PkgId) = pkg
+function aspkgid(m::Module)
+    if !ispackage(m)
+        error("Non-package (non-toplevel) module is not supported.",
+              " Got: $m")
+    end
+    return PkgId(m)
+end
+function aspkgid(name::Symbol)
+    # Maybe `Base.depwarn()`
+    return Base.identify_package(String(name)) :: PkgId
+end
+
+ispackage(m::Module) =
+    if m === Base
+        true
+    else
+        parentmodule(m) == m
+    end
+
+function _test_ambiguities(
+    packages::Vector{PkgId};
+    color::Union{Bool, Nothing} = nothing,
+)
+    packages_repr = reprpkgids(collect(packages))
 
     # Ambiguity test is run inside a clean process.
     # https://github.com/JuliaLang/julia/issues/28804
     code = """
     $(Base.load_path_setup_code())
     using Aqua
-    Aqua.test_ambiguities_impl($packages_repr)
+    Aqua.test_ambiguities_impl($packages_repr) || exit(1)
     """
     cmd = Base.julia_cmd()
-    if Base.JLOptions().color == 1
+    if something(color, Base.JLOptions().color == 1)
         cmd = `$cmd --color=yes`
     end
     cmd = `$cmd --startup-file=no -e $code`
     @test success(pipeline(cmd; stdout=stdout, stderr=stderr))
 end
 
-function test_ambiguities(m::Module)
-    if !ispackage(m)
-        error("Non-package (non-toplevel) module is not supported.")
+function reprpkgids(packages::Vector{PkgId})
+    packages_repr = sprint() do io
+        println(io, '[')
+        for pkg in packages
+            println(io, reprpkgid(pkg))
+        end
+        println(io, ']')
     end
-    test_ambiguities([nameof(m)])
+    @assert Base.eval(Main, Meta.parse(packages_repr)) == packages
+    return packages_repr
 end
 
-ispackage(m::Module) = parentmodule(m) == m
+function reprpkgid(pkg::PkgId)
+    name = pkg.name
+    if pkg.uuid === nothing
+        return "Base.PkgId($(repr(name)))"
+    end
+    uuid = pkg.uuid.value
+    return "Base.PkgId(Base.UUID($(repr(uuid))), $(repr(name)))"
+end
 
-load_package(m::Module) = m
-load_package(name::Union{Symbol, AbstractString}) =
-    Base.require(Base.identify_package(String(name)))
-
-function test_ambiguities_impl(packages)
-    modules = map(load_package, packages)
+function test_ambiguities_impl(packages::Vector{PkgId})
+    modules = map(Base.require, packages)
     @debug "Testing method ambiguities" modules
     ambiguities = detect_ambiguities(modules...; recursive=true)
-    @test ambiguities == []
+    if !isempty(ambiguities)
+        printstyled("$(length(ambiguities)) ambiguities found", color=:red)
+        println()
+    end
+    for (i, (m1, m2)) in enumerate(ambiguities)
+        println("Ambiguity #", i)
+        println(m1)
+        println(m2)
+        println()
+    end
+    return ambiguities == []
 end
